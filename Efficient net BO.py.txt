@@ -1,0 +1,256 @@
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import datasets, models, transforms
+from torch.utils.data import DataLoader, random_split
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import AdaBoostClassifier
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from PIL import Image
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import joblib
+
+# —— Config —— 
+DATA_DIR = "AUGMENTED"
+BATCH_SIZE = 16
+NUM_EPOCHS = 50# increased epochs
+LR = 1e-4
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# —— Transforms & Dataset —— 
+transform = transforms.Compose([ 
+    transforms.Resize((224, 224)), 
+    transforms.RandomHorizontalFlip(), 
+    transforms.RandomRotation(10), 
+    transforms.ColorJitter(brightness=0.2, contrast=0.2), 
+    transforms.ToTensor(), 
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]), 
+])
+
+full_ds = datasets.ImageFolder(DATA_DIR, transform=transform) 
+class_names = full_ds.classes
+
+train_size = int(0.8 * len(full_ds)) 
+val_size = len(full_ds) - train_size 
+train_ds, val_ds = random_split(full_ds, [train_size, val_size])
+
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True) 
+val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
+
+# —— Model setup (EfficientNetB0) —— 
+from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
+weights = EfficientNet_B0_Weights.DEFAULT
+model = efficientnet_b0(weights=weights)
+model.classifier[1] = nn.Linear(model.classifier[1].in_features, len(class_names))
+model = model.to(DEVICE)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=LR)
+
+# —— Training —— 
+train_acc, val_acc = [], []
+
+for epoch in range(1, NUM_EPOCHS + 1):
+    model.train()
+    correct, total = 0, 0
+    for x, y in train_loader:
+        x, y = x.to(DEVICE), y.to(DEVICE)
+        optimizer.zero_grad()
+        out = model(x)
+        loss = criterion(out, y)
+        loss.backward()
+        optimizer.step()
+
+        preds = out.argmax(dim=1)
+        correct += (preds == y).sum().item()
+        total += y.size(0)
+    epoch_train_acc = correct / total
+    train_acc.append(epoch_train_acc)
+
+    # Validation
+    model.eval()
+    correct, total = 0, 0
+    with torch.no_grad():
+        for x, y in val_loader:
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            out = model(x)
+            preds = out.argmax(dim=1)
+            correct += (preds == y).sum().item()
+            total += y.size(0)
+    epoch_val_acc = correct / total
+    val_acc.append(epoch_val_acc)
+
+    print(f"Epoch {epoch}/{NUM_EPOCHS} — Train Acc: {epoch_train_acc:.4f} — Val Acc: {epoch_val_acc:.4f}")
+
+torch.save(model.state_dict(), "efficientnet_liver_model.pth")
+
+# —— Plot Accuracy —— 
+plt.figure(figsize=(8,6))
+plt.plot(range(1, NUM_EPOCHS + 1), train_acc, label="Train Accuracy", marker='o')
+plt.plot(range(1, NUM_EPOCHS + 1), val_acc, label="Validation Accuracy", marker='o')
+plt.title("Training and Validation Accuracy (EfficientNetB0)")
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# —— Ultrasound Check —— 
+def is_valid_ultrasound(img):
+    img_np = np.array(img)
+    if img_np.ndim == 3 and img_np.shape[2] == 3:
+        r, g, b = img_np[:, :, 0], img_np[:, :, 1], img_np[:, :, 2]
+        diff = np.abs(r.astype(int) - g.astype(int)) + np.abs(g.astype(int) - b.astype(int)) + np.abs(b.astype(int) - r.astype(int))
+        if np.mean(diff) > 20:
+            return False
+    gray_img = img.convert("L")
+    gray_np = np.array(gray_img)
+    brightness = gray_np.mean()
+    contrast = gray_np.std()
+    if brightness > 150 or contrast < 30:
+        return False
+    if img_np.shape[0] < 100 or img_np.shape[1] < 100:
+        return False
+    return True
+
+# —— EfficientNet Prediction —— 
+def predict_image(img_path):
+    img = Image.open(img_path).convert("RGB")
+    if not is_valid_ultrasound(img):
+        raise ValueError("The image does not appear to be a liver ultrasound.")
+    input_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+    model.eval()
+    inp = input_transform(img).unsqueeze(0).to(DEVICE)
+    with torch.no_grad():
+        outputs = model(inp)
+        pred_idx = outputs.argmax(dim=1).item()
+        conf = torch.softmax(outputs, dim=1)[0][pred_idx].item()
+        cls = class_names[pred_idx].lower()
+        risk = "LOW RISK" if "non" in cls or "normal" in cls else "HIGH RISK"
+        return cls.title(), risk, conf
+
+# —— AdaBoost Classifier (unchanged) —— 
+data = pd.read_csv('ILP4SO.csv', encoding='latin1', on_bad_lines='skip')
+columns_to_use = ['Age', 'Direct_Bilrubin', 'Alkaline_Phosphotase',
+                  'Alamine_Aminotransferase', 'Aspartate_Aminotransferase',
+                  'Albumin', 'Albumin_and_Globulin_Ratio', 'Outcome']
+data = data[columns_to_use]
+for col in columns_to_use:
+    data[col] = pd.to_numeric(data[col], errors='coerce')
+data.dropna(inplace=True)
+
+mean_std = {
+    'Direct_Bilrubin': (1.733967391, 3.19066463),
+    'Alkaline_Phosphotase': (313.1059783, 259.3162459),
+    'Alamine_Aminotransferase': (102.8369565, 221.459206),
+    'Aspartate_Aminotransferase': (142.6494565, 355.6825106),
+    'Albumin': (3.144021739, 0.789170671),
+    'Albumin_and_Globulin_Ratio': (0.935663072, 0.319125293)
+}
+
+def apply_normalization(df):
+    df = df.copy()
+    for feature, (mean, std) in mean_std.items():
+        if feature in df.columns:
+            df[feature] = (df[feature] - mean) / std
+    return df
+
+X = data.drop(columns='Outcome')
+y = data['Outcome']
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+X_train_norm = apply_normalization(X_train)
+model_adaboost = AdaBoostClassifier(n_estimators=100, random_state=42)
+model_adaboost.fit(X_train_norm, y_train)
+joblib.dump(model_adaboost, "adaboost_model.pkl")
+
+
+# AdaBoost Accuracy
+from sklearn.metrics import accuracy_score
+X_test_norm = apply_normalization(X_test)
+y_pred = model_adaboost.predict(X_test_norm)
+ada_accuracy = accuracy_score(y_test, y_pred)
+print(f"AdaBoost Test Accuracy: {ada_accuracy:.4f}")
+
+def normalize_input(input_dict):
+    normalized_input = {}
+    for key, value in input_dict.items():
+        if key in mean_std:
+            mean, std = mean_std[key]
+            normalized_input[key] = (value - mean) / std
+        else:
+            normalized_input[key] = value
+    return normalized_input
+
+# —— Combined GUI —— 
+class CombinedGUI(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Unified Liver Diagnosis System")
+        self.geometry("600x700")
+        self.configure(bg="#e6f7ff")
+        self.features = ['Age', 'Direct_Bilrubin', 'Alkaline_Phosphotase',
+                         'Alamine_Aminotransferase', 'Aspartate_Aminotransferase',
+                         'Albumin', 'Albumin_and_Globulin_Ratio']
+        self.entries = {}
+        self.create_widgets()
+
+    def create_widgets(self):
+        tk.Label(self, text="Upload Ultrasound Image", font=('Arial', 14, 'bold'), bg="#e6f7ff").pack(pady=10)
+        tk.Button(self, text="Choose Image", command=self.handle_image, bg="#4CAF50", fg="white",
+                  font=('Arial', 12)).pack(pady=5)
+
+        tk.Label(self, text="Or Enter Clinical Data", font=('Arial', 14, 'bold'), bg="#e6f7ff").pack(pady=10)
+        frame = tk.Frame(self, bg="#e6f7ff")
+        frame.pack(pady=5)
+
+        for i, feat in enumerate(self.features):
+            tk.Label(frame, text=feat, font=('Arial', 11), bg="#e6f7ff").grid(row=i, column=0, sticky='e', padx=5, pady=3)
+            entry = tk.Entry(frame)
+            entry.grid(row=i, column=1, padx=5, pady=3)
+            self.entries[feat] = entry
+
+        tk.Button(self, text="Predict from Data", command=self.handle_data, bg="#2196F3", fg="white",
+                  font=('Arial', 12)).pack(pady=15)
+
+        # Display AdaBoost accuracy in GUI
+        tk.Label(self, text=f"AdaBoost Accuracy: {ada_accuracy:.4f}", font=('Arial', 12, 'bold'), bg="#e6f7ff").pack(pady=10)
+
+    def handle_image(self):
+        filepath = filedialog.askopenfilename(
+            title="Select Liver Ultrasound Image",
+            filetypes=[("Image Files", "*.jpg *.jpeg *.png"), ("All Files", "*.*")])
+        if not filepath:
+            return
+        try:
+            cls, risk, conf = predict_image(filepath)
+            messagebox.showinfo("Prediction Result",
+                                f"Class: {cls}\nConfidence: {conf:.2f}\nPatient is at {risk}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def handle_data(self):
+        try:
+            input_values = {feat: float(self.entries[feat].get()) for feat in self.features}
+        except ValueError:
+            messagebox.showerror("Input Error", "Please enter valid numbers.")
+            return
+        norm_vals = normalize_input(input_values)
+        input_df = pd.DataFrame([norm_vals], columns=self.features)
+        prediction = model_adaboost.predict(input_df)[0]
+        if prediction == 1:
+            msg = "You are suffering from liver disease, but stay positive. Insha'Allah you will recover soon."
+        else:
+            msg = "Congratulations! You are normal."
+        messagebox.showinfo("Diagnostic Result", msg)
+
+if __name__ == "__main__":
+    app = CombinedGUI()
+    app.mainloop()
